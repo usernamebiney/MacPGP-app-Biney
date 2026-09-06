@@ -95,3 +95,15 @@ site:
 
 - Website: [MacPGP Website](https://thalesmms.github.io/MacPGP-app/)
 - Privacy Policy: [MacPGP Privacy Policy](https://thalesmms.github.io/MacPGP-app/privacy.html)
+
+## Fork Notice
+
+This repository is a modified fork of the original **MacPGP** project by **ThalesMMS**.
+
+This fork includes modifications for Intel (`x86_64`) Mac support, macOS Sequoia compatibility, stability fixes, and other changes described in the release notes.
+
+The original project is licensed under the **Apache License 2.0**.
+
+Original project: https://github.com/ThalesMMS/MacPGP-app
+
+This fork is independently maintained and is not affiliated with, endorsed by, or officially supported by the original MacPGP project or its authors.
