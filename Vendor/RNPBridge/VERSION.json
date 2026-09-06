@@ -1,0 +1,11 @@
+{
+  "name": "RNPBridge",
+  "rnpVersion": "0.18.1",
+  "botanVersion": "3.11.11.1",
+  "jsonCVersion": "0.18",
+  "architectures": [
+    "arm64",
+    "x86_64"
+  ],
+  "buildNotes": "Regenerate with Vendor/RNPBridge/scripts/build-rnp-bridge.sh on an Intel Mac to add/refresh the x86_64 slice; the existing arm64 slice is preserved."
+}

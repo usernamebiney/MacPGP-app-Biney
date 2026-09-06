@@ -1,0 +1,321 @@
+import SwiftUI
+import UniformTypeIdentifiers
+import AppKit
+
+struct ContentView: View {
+    @Environment(KeyringService.self) private var keyringService
+    @Environment(SessionStateManager.self) private var sessionState
+    @State private var selectedSidebarItem: SidebarItem? = .keyring
+    @State private var selectedKey: PGPKeyModel?
+    @State private var showingKeyGeneration = false
+    @State private var showingImportSheet = false
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var notificationService = NotificationService()
+
+    private var needsDetailColumn: Bool {
+        selectedSidebarItem == .keyring
+    }
+
+    var body: some View {
+        Group {
+            if needsDetailColumn {
+                NavigationSplitView(columnVisibility: $columnVisibility) {
+                    SidebarView(selection: $selectedSidebarItem)
+                } content: {
+                    KeyringView(selectedKey: $selectedKey)
+                } detail: {
+                    detailView
+                }
+            } else {
+                NavigationSplitView {
+                    SidebarView(selection: $selectedSidebarItem)
+                } detail: {
+                    contentView
+                }
+            }
+        }
+        .navigationSplitViewStyle(.balanced)
+        .sheet(isPresented: $showingKeyGeneration) {
+            KeyGenerationView()
+        }
+        .fileImporter(
+            isPresented: $showingImportSheet,
+            allowedContentTypes: [.data],
+            allowsMultipleSelection: true
+        ) { result in
+            handleImport(result)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showKeyGeneration)) { _ in
+            showingKeyGeneration = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .importKey)) { _ in
+            showingImportSheet = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ExtensionCommunicationService.encryptFilesNotification)) { notification in
+            handleEncryptFiles(notification)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ExtensionCommunicationService.decryptFilesNotification)) { notification in
+            handleDecryptFiles(notification)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .encryptClipboard)) { _ in
+            handleEncryptClipboard()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .decryptClipboard)) { _ in
+            handleDecryptClipboard()
+        }
+        // Recompute time-dependent key validity (expiration) when the app
+        // reactivates, the system clock changes, or the calendar day rolls over,
+        // so recipient/signing lists and banners stay correct without a relaunch.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            keyringService.refreshKeyValidity()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .NSSystemClockDidChange)) { _ in
+            keyringService.refreshKeyValidity()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .NSCalendarDayChanged)) { _ in
+            keyringService.refreshKeyValidity()
+        }
+        .environment(notificationService)
+    }
+
+    @ViewBuilder
+    private var contentView: some View {
+        switch selectedSidebarItem {
+        case .encrypt:
+            EncryptView()
+        case .decrypt:
+            DecryptView()
+        case .sign:
+            SignView()
+        case .verify:
+            VerifyView()
+        case .keyring, nil:
+            Text(String(localized: "content.select_item",
+                        comment: "Fallback text when no sidebar item is selected"))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var detailView: some View {
+        if let key = selectedKey {
+            KeyDetailsView(key: key) { updatedKey in
+                selectedKey = updatedKey
+            }
+        } else {
+            ContentUnavailableView(
+                String(localized: "content.no_key_selected", comment: "Title shown when no PGP key is selected"),
+                systemImage: "key",
+                description: Text(String(localized: "content.select_key_details", comment: "Description prompting user to select a key"))
+            )
+        }
+    }
+
+    private func handleImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            for url in urls {
+                do {
+                    let importedKeys = try keyringService.importKey(from: url)
+                    if let firstKey = importedKeys.first {
+                        selectedKey = firstKey
+                    }
+                } catch {
+                    print("Import failed: \(error)")
+                }
+            }
+        case .failure(let error):
+            print("File selection failed: \(error)")
+        }
+    }
+
+    private func handleEncryptFiles(_ notification: Notification) {
+        guard let urls = notification.userInfo?[ExtensionCommunicationService.fileURLsKey] as? [URL],
+              !urls.isEmpty else {
+            return
+        }
+
+        // Switch to encrypt view
+        selectedSidebarItem = .encrypt
+
+        // Set file mode and populate files
+        sessionState.encryptInputMode = .file
+        sessionState.encryptSelectedFiles = urls
+    }
+
+    private func handleDecryptFiles(_ notification: Notification) {
+        guard let urls = notification.userInfo?[ExtensionCommunicationService.fileURLsKey] as? [URL],
+              !urls.isEmpty else {
+            return
+        }
+
+        // Switch to decrypt view
+        selectedSidebarItem = .decrypt
+
+        // Set file mode and populate files
+        sessionState.decryptInputMode = .file
+        sessionState.decryptSelectedFiles = urls
+    }
+
+    private func handleEncryptClipboard() {
+        notificationService.requestAuthorizationIfNeeded()
+
+        // Check if clipboard has text
+        guard let clipboardText = NSPasteboard.general.string(forType: .string),
+              !clipboardText.isEmpty else {
+            notificationService.showError(
+                title: String(localized: "error.clipboard_empty", comment: "Error title when clipboard has no content"),
+                message: String(localized: "error.no_text_in_clipboard", comment: "Error message when clipboard has no text")
+            )
+            return
+        }
+
+        // Check if recipients are selected
+        guard !sessionState.encryptSelectedRecipients.isEmpty else {
+            notificationService.showError(
+                title: String(localized: "error.no_recipients", comment: "Error title when no encryption recipients are selected"),
+                message: String(localized: "error.select_recipients_first", comment: "Error message prompting user to select recipients")
+            )
+            return
+        }
+
+        let encryptionService = EncryptionService(keyringService: keyringService)
+        var passphrase: String?
+        var signerKeyForCache: PGPKeyModel?
+
+        // If signing key is selected, try to get passphrase from session cache or keychain.
+        if let signerKey = sessionState.encryptSignerKey {
+            passphrase = PassphraseCache.shared.passphrase(for: signerKey)
+                ?? (try? KeychainManager.shared.retrievePassphrase(for: signerKey))
+            if passphrase == nil {
+                notificationService.showError(
+                    title: String(localized: "error.passphrase_required", comment: "Error title when passphrase is required for signing"),
+                    message: String(localized: "error.enter_passphrase_for_signing", comment: "Error message prompting user to enter passphrase in Encrypt view")
+                )
+                return
+            }
+
+            signerKeyForCache = signerKey
+        }
+
+        Task {
+            do {
+                let recipients = Array(sessionState.encryptSelectedRecipients)
+                let encrypted = try encryptionService.encrypt(
+                    message: clipboardText,
+                    for: recipients,
+                    signedBy: sessionState.encryptSignerKey,
+                    passphrase: passphrase,
+                    armored: sessionState.encryptArmorOutput
+                )
+
+                await MainActor.run {
+                    if let signerKeyForCache, let passphrase {
+                        PassphraseCache.shared.store(passphrase, for: signerKeyForCache)
+                    }
+
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(encrypted, forType: .string)
+
+                    notificationService.showSuccess(
+                        title: String(localized: "success.encryption_successful", comment: "Success title when clipboard encryption completes"),
+                        message: String(localized: "success.clipboard_encrypted", comment: "Success message confirming clipboard contents were encrypted")
+                    )
+                }
+            } catch {
+                await MainActor.run {
+                    notificationService.showError(
+                        title: String(localized: "error.encryption_failed.title", comment: "Error title when encryption operation fails"),
+                        message: error.localizedDescription
+                    )
+                }
+            }
+        }
+    }
+
+    private func handleDecryptClipboard() {
+        notificationService.requestAuthorizationIfNeeded()
+
+        // Check if clipboard has text
+        guard let clipboardText = NSPasteboard.general.string(forType: .string),
+              !clipboardText.isEmpty else {
+            notificationService.showError(
+                title: String(localized: "error.clipboard_empty", comment: "Error title when clipboard has no content"),
+                message: String(localized: "error.no_text_in_clipboard", comment: "Error message when clipboard has no text")
+            )
+            return
+        }
+
+        // Check if secret keys are available
+        guard !keyringService.secretKeys().isEmpty else {
+            notificationService.showError(
+                title: String(localized: "error.no_secret_keys", comment: "Error title when no secret keys are available"),
+                message: String(localized: "error.no_secret_keys_for_decryption", comment: "Error message when no secret keys available for decryption")
+            )
+            return
+        }
+
+        let encryptionService = EncryptionService(keyringService: keyringService)
+
+        Task {
+            do {
+                guard clipboardText.data(using: .utf8) != nil else {
+                    throw OperationError.decryptionFailed(underlying: nil)
+                }
+
+                // Try all secret keys with session-cache or keychain passphrases.
+                var decrypted: String?
+                for key in keyringService.secretKeys() {
+                    if let passphrase = await MainActor.run(body: { PassphraseCache.shared.passphrase(for: key) })
+                        ?? (try? KeychainManager.shared.retrievePassphrase(for: key)) {
+                        do {
+                            decrypted = try encryptionService.decrypt(
+                                message: clipboardText,
+                                using: key,
+                                passphrase: passphrase
+                            )
+                            await MainActor.run {
+                                PassphraseCache.shared.store(passphrase, for: key)
+                            }
+                            break
+                        } catch {
+                            // Try next key
+                            continue
+                        }
+                    }
+                }
+
+                guard let result = decrypted else {
+                    throw OperationError.unknownError(message: String(localized: "error.no_valid_passphrase", comment: "Error message when no valid passphrase found in keychain for decryption"))
+                }
+
+                await MainActor.run {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(result, forType: .string)
+
+                    notificationService.showSuccess(
+                        title: String(localized: "success.decryption_successful", comment: "Success title when clipboard decryption completes"),
+                        message: String(localized: "success.clipboard_decrypted", comment: "Success message confirming clipboard contents were decrypted")
+                    )
+                }
+            } catch {
+                await MainActor.run {
+                    notificationService.showError(
+                        title: String(localized: "error.decryption_failed.title", comment: "Error title when decryption operation fails"),
+                        message: error.localizedDescription
+                    )
+                }
+            }
+        }
+    }
+}
+
+#Preview {
+    let keyringService = KeyringService()
+    let trustService = TrustService(keyringService: keyringService)
+
+    return ContentView()
+        .environment(keyringService)
+        .environment(SessionStateManager())
+        .environment(trustService)
+}

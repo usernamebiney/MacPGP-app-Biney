@@ -1,0 +1,57 @@
+/*
+ * Localizable.strings
+ * QuickLookExtension
+ *
+ * English localization strings for Quick Look previews.
+ *
+ * Quick Look is metadata-only in v1 (issue #136): it shows encryption metadata
+ * and directs the user to open MacPGP to decrypt. There are intentionally no
+ * decryption, passphrase, or "Decrypt Preview" strings here — see
+ * scripts/check-quicklook-scope.sh and docs/V1_SCOPE.md.
+ */
+
+/* Header shown when Quick Look is displaying encrypted file metadata. */
+"quicklook_encryption_pgp_encrypted_file" = "PGP Encrypted File";
+
+/* Section title for encryption details in the Quick Look metadata preview. */
+"quicklook_encryption_information_section" = "Encryption Information";
+
+/* Metadata label for the encryption algorithm. */
+"quicklook_algorithm_label" = "Algorithm";
+
+/* Metadata label for integrity protection status. */
+"quicklook_integrity_protection_label" = "Integrity Protection";
+
+/* Metadata value shown when integrity protection is present. */
+"quicklook_integrity_protection_yes_mdc" = "Yes (MDC)";
+
+/* Generic negative metadata value. */
+"quicklook_no" = "No";
+
+/* Metadata label for compression information. */
+"quicklook_compression_label" = "Compression";
+
+/* Section title for recipient key IDs in the Quick Look metadata preview. */
+"quicklook_recipients_section" = "Recipients";
+
+/* Message shown when no recipient metadata is available. */
+"quicklook_no_recipient_information" = "No recipient information available";
+
+/* Section title for file details in the Quick Look metadata preview. */
+"quicklook_file_information_section" = "File Information";
+
+/* Metadata label for the encrypted file size. */
+"quicklook_file_size_label" = "File Size";
+
+/* Metadata label for the original filename stored in encrypted content. */
+"quicklook_original_name_label" = "Original Name";
+
+/* Metadata label for the original creation date. */
+"quicklook_created_label" = "Created";
+
+/* Metadata-only Quick Look (issue #136): decryption happens in the main app. */
+"quicklook_open_in_app_to_decrypt" = "To decrypt this file, open it in MacPGP.";
+
+/* issue #148: error view */
+"quicklook_unable_to_read_title" = "Unable to Read Encrypted File";
+"quicklook_unable_to_read_message" = "MacPGP could not display this preview. Open the file in MacPGP to inspect it.";

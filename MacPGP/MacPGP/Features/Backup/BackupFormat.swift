@@ -1,0 +1,131 @@
+import Foundation
+import CryptoKit
+
+nonisolated enum BackupVersion: String, Codable, Sendable {
+    case v1 = "1.0"
+}
+
+nonisolated enum BackupEncryptionType: String, Codable, Sendable {
+    case none = "none"
+    case aes256 = "aes256"
+}
+
+nonisolated struct BackupFormat: Codable, Identifiable, Sendable {
+    let id: UUID
+    let version: BackupVersion
+    let createdDate: Date
+    let createdBy: String
+    let keyFingerprints: [String]
+    let encryptionType: BackupEncryptionType
+    let checksum: String?
+    let metadata: BackupMetadata
+
+    init(
+        version: BackupVersion = .v1,
+        keyFingerprints: [String],
+        encryptionType: BackupEncryptionType,
+        createdBy: String,
+        metadata: BackupMetadata = BackupMetadata()
+    ) {
+        self.id = UUID()
+        self.version = version
+        self.createdDate = Date()
+        self.createdBy = createdBy
+        self.keyFingerprints = keyFingerprints
+        self.encryptionType = encryptionType
+        self.checksum = nil
+        self.metadata = metadata
+    }
+
+    var isEncrypted: Bool {
+        encryptionType != .none
+    }
+
+    var keyCount: Int {
+        keyFingerprints.count
+    }
+
+    var formattedCreatedDate: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: createdDate)
+    }
+
+    var displayDescription: String {
+        let keyText = keyCount == 1 ? "key" : "keys"
+        let encryptionText = isEncrypted ? "Encrypted" : "Unencrypted"
+        return "\(encryptionText) backup of \(keyCount) \(keyText)"
+    }
+
+    /// Creates a new BackupFormat with the specified checksum.
+    /// - Parameters:
+    ///   - checksum: The checksum value to set.
+    /// - Returns: A new BackupFormat instance with the updated checksum and all other properties preserved from this instance.
+    func withChecksum(_ checksum: String) -> BackupFormat {
+        BackupFormat(
+            id: id,
+            version: version,
+            createdDate: createdDate,
+            createdBy: createdBy,
+            keyFingerprints: keyFingerprints,
+            encryptionType: encryptionType,
+            checksum: checksum,
+            metadata: metadata
+        )
+    }
+
+    private init(
+        id: UUID,
+        version: BackupVersion,
+        createdDate: Date,
+        createdBy: String,
+        keyFingerprints: [String],
+        encryptionType: BackupEncryptionType,
+        checksum: String?,
+        metadata: BackupMetadata
+    ) {
+        self.id = id
+        self.version = version
+        self.createdDate = createdDate
+        self.createdBy = createdBy
+        self.keyFingerprints = keyFingerprints
+        self.encryptionType = encryptionType
+        self.checksum = checksum
+        self.metadata = metadata
+    }
+}
+
+nonisolated struct BackupMetadata: Codable, Sendable {
+    let name: String?
+    let description: String?
+    let deviceName: String
+
+    init(
+        name: String? = nil,
+        description: String? = nil,
+        deviceName: String? = nil
+    ) {
+        self.name = name
+        self.description = description
+        self.deviceName = deviceName ?? Host.current().localizedName ?? "Unknown Device"
+    }
+}
+
+extension BackupFormat {
+    static var preview: BackupFormat {
+        BackupFormat(
+            keyFingerprints: [
+                "ABCD1234EFGH5678IJKL9012MNOP3456",
+                "QRST7890UVWX1234YZAB5678CDEF9012"
+            ],
+            encryptionType: .aes256,
+            createdBy: "preview@example.com",
+            metadata: BackupMetadata(
+                name: "My Keys Backup",
+                description: "Backup of my primary PGP keys",
+                deviceName: "MacBook Pro"
+            )
+        )
+    }
+}

@@ -1,0 +1,210 @@
+import Foundation
+import RNPKit
+
+nonisolated struct KeyGenerationParameters {
+    var name: String
+    var email: String
+    var comment: String?
+    var passphrase: String
+    var algorithm: KeyAlgorithm
+    var keySize: Int
+    var expirationMonths: Int?
+
+    var userID: String {
+        var result = name
+        if let comment = comment, !comment.isEmpty {
+            result += " (\(comment))"
+        }
+        result += " <\(email)>"
+        return result
+    }
+
+    init(
+        name: String,
+        email: String,
+        comment: String? = nil,
+        passphrase: String,
+        algorithm: KeyAlgorithm = .rsa,
+        keySize: Int = 4096,
+        expirationMonths: Int? = 24
+    ) {
+        self.name = name
+        self.email = email
+        self.comment = comment
+        self.passphrase = passphrase
+        self.algorithm = algorithm
+        self.keySize = keySize
+        self.expirationMonths = expirationMonths
+    }
+}
+
+nonisolated final class KeyGenerationService: Sendable {
+    static let shared = KeyGenerationService()
+
+    private let makeGenerator: @Sendable () -> KeyGenerator
+
+    /// - Parameter makeGenerator: factory for the underlying RNPKit generator.
+    ///   Tests inject a generator backed by a throwing closure to exercise
+    ///   failure handling without invoking librnp.
+    init(makeGenerator: @escaping @Sendable () -> KeyGenerator = { KeyGenerator() }) {
+        self.makeGenerator = makeGenerator
+    }
+
+    func generateKey(with parameters: KeyGenerationParameters) throws -> Key {
+        let keyGenerator = makeGenerator()
+
+        keyGenerator.keyBitsLength = Int32(parameters.keySize)
+
+        switch parameters.algorithm {
+        case .rsa:
+            keyGenerator.keyAlgorithm = .RSA
+        case .ecdsa:
+            keyGenerator.keyAlgorithm = .ECDSA
+        case .eddsa:
+            keyGenerator.keyAlgorithm = .edDSA
+        default:
+            keyGenerator.keyAlgorithm = .RSA
+        }
+
+        let key = try keyGenerator.generate(
+            for: parameters.userID,
+            passphrase: parameters.passphrase
+        )
+
+        if let expirationMonths = parameters.expirationMonths,
+           expirationMonths > 0,
+           let expirationDate = Calendar.current.date(byAdding: .month, value: expirationMonths, to: Date()) {
+            return try key.setExpiration(
+                expirationDate,
+                passphraseForKey: { _ in parameters.passphrase }
+            )
+        }
+
+        return key
+    }
+
+    func generateKeyAsync(
+        with parameters: KeyGenerationParameters,
+        progress: @escaping @MainActor (Double) -> Void = { _ in }
+    ) async throws -> Key {
+        await progress(0.1)
+
+        do {
+            let key = try await Task.detached(priority: .userInitiated) {
+                try self.generateKey(with: parameters)
+            }.value
+
+            await progress(1.0)
+
+            return key
+        } catch {
+            throw OperationError.keyGenerationFailed(underlying: error)
+        }
+    }
+
+    func validatePassphrase(_ passphrase: String) -> [PassphraseValidationIssue] {
+        var issues: [PassphraseValidationIssue] = []
+
+        if passphrase.count < 8 {
+            issues.append(.tooShort(minimum: 8))
+        }
+
+        if passphrase.count > 0 && passphrase.rangeOfCharacter(from: .uppercaseLetters) == nil {
+            issues.append(.noUppercase)
+        }
+
+        if passphrase.count > 0 && passphrase.rangeOfCharacter(from: .lowercaseLetters) == nil {
+            issues.append(.noLowercase)
+        }
+
+        if passphrase.count > 0 && passphrase.rangeOfCharacter(from: .decimalDigits) == nil {
+            issues.append(.noDigit)
+        }
+
+        let specialCharacters = CharacterSet(charactersIn: "!@#$%^&*()_+-=[]{}|;':\",./<>?")
+        if passphrase.count > 0 && passphrase.rangeOfCharacter(from: specialCharacters) == nil {
+            issues.append(.noSpecialCharacter)
+        }
+
+        return issues
+    }
+
+    /// Evaluates the strength of a passphrase.
+    /// - Returns: A `PassphraseStrength` value indicating the passphrase's strength.
+    func passphraseStrength(_ passphrase: String) -> PassphraseStrength {
+        let issues = validatePassphrase(passphrase)
+
+        if passphrase.isEmpty {
+            return .none
+        }
+
+        let score = 5 - issues.count
+
+        switch score {
+        case 5:
+            return passphrase.count >= 12 ? .strong : .good
+        case 4:
+            return .good
+        case 3:
+            return .fair
+        case 2:
+            return .weak
+        default:
+            return .veryWeak
+        }
+    }
+}
+
+nonisolated enum PassphraseValidationIssue {
+    case tooShort(minimum: Int)
+    case noUppercase
+    case noLowercase
+    case noDigit
+    case noSpecialCharacter
+
+    var description: String {
+        switch self {
+        case .tooShort(let minimum):
+            return "Must be at least \(minimum) characters"
+        case .noUppercase:
+            return "Should contain uppercase letters"
+        case .noLowercase:
+            return "Should contain lowercase letters"
+        case .noDigit:
+            return "Should contain numbers"
+        case .noSpecialCharacter:
+            return "Should contain special characters"
+        }
+    }
+}
+
+nonisolated enum PassphraseStrength: Int, CaseIterable {
+    case none = 0
+    case veryWeak = 1
+    case weak = 2
+    case fair = 3
+    case good = 4
+    case strong = 5
+
+    var description: String {
+        switch self {
+        case .none: return "No passphrase"
+        case .veryWeak: return "Very Weak"
+        case .weak: return "Weak"
+        case .fair: return "Fair"
+        case .good: return "Good"
+        case .strong: return "Strong"
+        }
+    }
+
+    var color: String {
+        switch self {
+        case .none: return "gray"
+        case .veryWeak: return "red"
+        case .weak: return "orange"
+        case .fair: return "yellow"
+        case .good: return "green"
+        case .strong: return "blue"
+        }
+    }
+}

@@ -1,0 +1,443 @@
+import Foundation
+import AppKit
+import SwiftUI
+
+/// Provides macOS Services menu integration for PGP operations
+/// This class handles system-wide encrypt, decrypt, and sign services
+/// that can be accessed from any application via the Services menu
+final class ServicesProvider: NSObject {
+    private let keyringService: KeyringService
+    private let encryptionService: EncryptionService
+    private let signingService: SigningService
+
+    init(keyringService: KeyringService) {
+        self.keyringService = keyringService
+        self.encryptionService = EncryptionService(keyringService: keyringService)
+        self.signingService = SigningService(keyringService: keyringService)
+        super.init()
+    }
+
+    func availableEncryptionKeys() -> [PGPKeyModel] {
+        keyringService.publicKeys()
+    }
+
+    func availableDecryptionKeys() -> [PGPKeyModel] {
+        keyringService.secretKeys()
+    }
+
+    func availableSigningKeys() -> [PGPKeyModel] {
+        keyringService.signingKeys()
+    }
+
+    // MARK: - Service Methods
+
+    /// Encrypts selected text from any application
+    /// This method is called by macOS Services when "Encrypt with MacPGP" is selected
+    @objc func encryptService(_ pasteboard: NSPasteboard, userData: String?, error: NSErrorPointer) {
+        guard let inputText = pasteboard.string(forType: .string), !inputText.isEmpty else {
+            showError("No text selected", description: "Please select text to encrypt")
+            return
+        }
+
+        // Get available public keys for encryption
+        let availableKeys = availableEncryptionKeys()
+        guard !availableKeys.isEmpty else {
+            showError("No public keys available", description: "Import public keys to encrypt messages")
+            return
+        }
+
+        // Show recipient picker on main thread
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+
+            guard let selectedRecipients = self.showRecipientPicker(),
+                  !selectedRecipients.isEmpty else {
+                return // User cancelled or no recipients selected
+            }
+
+            // Perform encryption with selected recipients
+            do {
+                let encryptedMessage = try self.encryptionService.encrypt(
+                    message: inputText,
+                    for: Array(selectedRecipients),
+                    signedBy: nil,
+                    passphrase: nil,
+                    armored: true
+                )
+                self.writeResult(encryptedMessage, to: pasteboard)
+            } catch {
+                self.showError("Encryption failed", description: error.localizedDescription)
+            }
+        }
+    }
+
+    /// Decrypts selected PGP message from any application
+    /// This method is called by macOS Services when "Decrypt with MacPGP" is selected
+    @objc func decryptService(_ pasteboard: NSPasteboard, userData: String?, error: NSErrorPointer) {
+        guard let inputText = pasteboard.string(forType: .string), !inputText.isEmpty else {
+            showError("No text selected", description: "Please select a PGP encrypted message to decrypt")
+            return
+        }
+
+        // Verify this looks like a PGP message
+        guard inputText.contains("-----BEGIN PGP MESSAGE-----") else {
+            showError("Invalid PGP message", description: "The selected text does not appear to be a PGP encrypted message")
+            return
+        }
+
+        // Get available secret keys for decryption
+        let secretKeys = availableDecryptionKeys()
+        guard !secretKeys.isEmpty else {
+            showError("No secret keys available", description: "Import a secret key to decrypt messages")
+            return
+        }
+
+        // Show key picker on main thread
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+
+            guard let (selectedKey, passphrase) = self.showKeyPicker(
+                secretKeys: secretKeys,
+                operation: "Decrypt Message"
+            ) else {
+                return // User cancelled
+            }
+
+            // Perform decryption with selected key and passphrase
+            do {
+                let decryptedMessage = try self.encryptionService.decrypt(
+                    message: inputText,
+                    using: selectedKey,
+                    passphrase: passphrase
+                )
+                self.writeResult(decryptedMessage, to: pasteboard)
+            } catch {
+                self.showError("Decryption failed", description: error.localizedDescription)
+            }
+        }
+    }
+
+    /// Signs selected text from any application
+    /// This method is called by macOS Services when "Sign with MacPGP" is selected
+    @objc func signService(_ pasteboard: NSPasteboard, userData: String?, error: NSErrorPointer) {
+        guard let inputText = pasteboard.string(forType: .string), !inputText.isEmpty else {
+            showError("No text selected", description: "Please select text to sign")
+            return
+        }
+
+        // Get available secret keys for signing
+        let secretKeys = availableSigningKeys()
+        guard !secretKeys.isEmpty else {
+            showError("No secret keys available", description: "Import or generate a key pair to sign messages")
+            return
+        }
+
+        // Show key picker on main thread
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+
+            guard let (selectedKey, passphrase) = self.showKeyPicker(
+                secretKeys: secretKeys,
+                operation: "Sign Message"
+            ) else {
+                return // User cancelled
+            }
+
+            // Perform signing with selected key and passphrase
+            do {
+                let signedMessage = try self.signingService.sign(
+                    message: inputText,
+                    using: selectedKey,
+                    passphrase: passphrase,
+                    cleartext: true,
+                    detached: false,
+                    armored: true
+                )
+                self.writeResult(signedMessage, to: pasteboard)
+            } catch {
+                self.showError("Signing failed", description: error.localizedDescription)
+            }
+        }
+    }
+
+    // MARK: - UI Selection Methods
+
+    /// Shows a modal dialog for selecting recipients (public keys) for encryption
+    /// Presents a modal dialog for selecting encryption key recipients.
+    /// - Returns: A set of selected recipients if confirmed, or `nil` if cancelled.
+    private func showRecipientPicker() -> Set<PGPKeyModel>? {
+        let availableKeys = availableEncryptionKeys().filter { !$0.isExpired }
+        guard !availableKeys.isEmpty else {
+            showError(
+                "No usable public keys available",
+                description: "All public keys available for encryption are expired"
+            )
+            return nil
+        }
+
+        var selectedRecipients: Set<PGPKeyModel> = []
+
+        let pickerView = RecipientSelectionView(
+            availableKeys: availableKeys,
+            selectedRecipients: Binding(
+                get: { selectedRecipients },
+                set: { selectedRecipients = $0 }
+            ),
+            onComplete: { _ in }
+        )
+
+        let hostingController = NSHostingController(rootView: pickerView)
+        hostingController.view.frame = NSRect(x: 0, y: 0, width: 450, height: 400)
+
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 450, height: 400),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Select Recipients"
+        panel.contentView = hostingController.view
+        panel.center()
+        panel.isReleasedWhenClosed = false
+
+        let response = NSApp.runModal(for: panel)
+        panel.close()
+
+        return response == .OK ? selectedRecipients : nil
+    }
+
+    /// Shows a modal dialog for selecting a secret key and entering passphrase
+    /// Presents a modal dialog for selecting a secret key and entering a passphrase.
+    /// - Parameters:
+    ///   - secretKeys: The available secret keys to select from.
+    ///   - operation: The operation name, used as the dialog title and confirmation button label.
+    /// - Returns: A tuple containing the selected key and passphrase if confirmed; `nil` if the user cancels or does not complete all required fields.
+    private func showKeyPicker(secretKeys: [PGPKeyModel], operation: String) -> (key: PGPKeyModel, passphrase: String)? {
+        var selectedKey: PGPKeyModel?
+        var passphrase: String = ""
+
+        let pickerView = KeyPassphraseSelectionView(
+            secretKeys: secretKeys,
+            operation: operation,
+            selectedKey: Binding(
+                get: { selectedKey },
+                set: { selectedKey = $0 }
+            ),
+            passphrase: Binding(
+                get: { passphrase },
+                set: { passphrase = $0 }
+            ),
+            onComplete: { _ in }
+        )
+
+        let hostingController = NSHostingController(rootView: pickerView)
+        hostingController.view.frame = NSRect(x: 0, y: 0, width: 400, height: 280)
+
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 280),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = operation
+        panel.contentView = hostingController.view
+        panel.center()
+        panel.isReleasedWhenClosed = false
+
+        let response = NSApp.runModal(for: panel)
+        panel.close()
+
+        if response == .OK, let key = selectedKey, !passphrase.isEmpty {
+            return (key, passphrase)
+        }
+        return nil
+    }
+
+    // MARK: - Helper Methods
+
+    /// Shows an error alert to the user
+    private func showError(_ message: String, description: String) {
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = message
+            alert.informativeText = description
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
+    }
+
+    /// Writes encrypted/signed result back to pasteboard
+    private func writeResult(_ result: String, to pasteboard: NSPasteboard) {
+        pasteboard.clearContents()
+        pasteboard.setString(result, forType: .string)
+    }
+}
+
+// MARK: - SwiftUI Selection Views
+
+/// SwiftUI view for selecting recipients (public keys) for encryption
+private struct RecipientSelectionView: View {
+    let availableKeys: [PGPKeyModel]
+    @Binding var selectedRecipients: Set<PGPKeyModel>
+    let onComplete: (NSApplication.ModalResponse) -> Void
+
+    @State private var searchText = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if availableKeys.isEmpty {
+                ContentUnavailableView(
+                    "No Keys Available",
+                    systemImage: "key",
+                    description: Text("recipients.import_first")
+                )
+                .frame(maxHeight: .infinity)
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("services.select_one_or_more_recipients_to_encrypt")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+
+                    TextField("Search recipients...", text: $searchText)
+                        .textFieldStyle(.roundedBorder)
+
+                    ScrollView {
+                        LazyVStack(spacing: 8) {
+                            ForEach(filteredKeys) { key in
+                                RecipientRow(
+                                    displayName: key.displayName,
+                                    email: key.email,
+                                    shortKeyID: key.shortKeyID,
+                                    isSelected: selectedRecipients.contains(key),
+                                    trustBadge: trustBadge(for: key)
+                                ) {
+                                    toggleSelection(key)
+                                }
+                            }
+                        }
+                    }
+                    .frame(maxHeight: .infinity)
+
+                    if !selectedRecipients.isEmpty {
+                        Divider()
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(String.localizedStringWithFormat(NSLocalizedString("common.selected_count_format", comment: ""), selectedRecipients.count))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            FlowLayout(spacing: 8) {
+                                ForEach(Array(selectedRecipients)) { key in
+                                    SelectedRecipientChip(displayName: key.displayName) {
+                                        selectedRecipients.remove(key)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            HStack {
+                Button("keygen.cancel") {
+                    onComplete(.cancel)
+                    NSApp.stopModal(withCode: .cancel)
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Spacer()
+
+                Button("sidebar.encrypt") {
+                    onComplete(.OK)
+                    NSApp.stopModal(withCode: .OK)
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(selectedRecipients.isEmpty)
+            }
+        }
+        .padding()
+    }
+
+    private var filteredKeys: [PGPKeyModel] {
+        if searchText.isEmpty {
+            return availableKeys
+        }
+
+        let query = searchText.lowercased()
+        return availableKeys.filter {
+            $0.displayName.lowercased().contains(query) ||
+            $0.email?.lowercased().contains(query) == true ||
+            $0.shortKeyID.lowercased().contains(query)
+        }
+    }
+
+    private func toggleSelection(_ key: PGPKeyModel) {
+        if selectedRecipients.contains(key) {
+            selectedRecipients.remove(key)
+        } else {
+            selectedRecipients.insert(key)
+        }
+    }
+
+    private func trustBadge(for key: PGPKeyModel) -> RecipientRow.TrustBadge? {
+        guard key.trustLevel != .unknown else { return nil }
+        return RecipientRow.TrustBadge(title: key.trustLevel.displayName, color: key.trustLevel.color)
+    }
+}
+
+/// SwiftUI view for selecting a secret key and entering passphrase
+private struct KeyPassphraseSelectionView: View {
+    let secretKeys: [PGPKeyModel]
+    let operation: String
+    @Binding var selectedKey: PGPKeyModel?
+    @Binding var passphrase: String
+    let onComplete: (NSApplication.ModalResponse) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(String.localizedStringWithFormat(NSLocalizedString("services.select_key_for_format", comment: ""), operation.lowercased()))
+                .font(.body)
+                .foregroundStyle(.secondary)
+
+            Picker("services.key", selection: $selectedKey) {
+                Text("decrypt.select_key_placeholder").tag(nil as PGPKeyModel?)
+                ForEach(secretKeys) { key in
+                    Text("\(key.displayName) (\(String(key.shortKeyID.suffix(8))))")
+                        .tag(key as PGPKeyModel?)
+                }
+            }
+            .pickerStyle(.menu)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("services.passphrase")
+                    .font(.body)
+
+                SecureField("Enter passphrase", text: $passphrase)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            Spacer()
+
+            HStack {
+                Button("keygen.cancel") {
+                    onComplete(.cancel)
+                    NSApp.stopModal(withCode: .cancel)
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Spacer()
+
+                Button(operation) {
+                    onComplete(.OK)
+                    NSApp.stopModal(withCode: .OK)
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(selectedKey == nil || passphrase.isEmpty)
+            }
+        }
+        .padding()
+    }
+}
